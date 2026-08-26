@@ -40,7 +40,8 @@ def cluster_products(feature_matrix, n_clusters):
       3. Recomputing centroids as the mean of assigned products
       4. Repeating until assignments stabilize (convergence)
     """
-    k = min(n_clusters, len(feature_matrix))  # can't have more clusters than products
+    distinct_points = np.unique(feature_matrix, axis=0).shape[0]
+    k = min(n_clusters, len(feature_matrix), distinct_points)
     model = KMeans(n_clusters=k, random_state=42, n_init=10)
     cluster_labels = model.fit_predict(feature_matrix)
     return cluster_labels, model
@@ -105,14 +106,19 @@ def get_recommendations(user_id):
     if dominant_cluster is None:
         return jsonify({'product_ids': [], 'reason': 'no_cluster_signal'})
 
-    # Candidate products: same cluster, not already seen
-    candidates = products_df[
+    # Prefer products from the user's cluster, but keep recommendations available
+    # when that cluster contains only products the user has already seen.
+    cluster_candidates = products_df[
         (products_df['cluster'] == dominant_cluster) &
         (~products_df['product_id'].isin(already_seen_ids))
     ]
 
+    candidates = cluster_candidates
     if candidates.empty:
-        return jsonify({'product_ids': [], 'reason': 'cluster_exhausted'})
+        candidates = products_df[~products_df['product_id'].isin(already_seen_ids)]
+
+    if candidates.empty:
+        return jsonify({'product_ids': [], 'reason': 'catalog_exhausted'})
 
     # Rank within the cluster using cosine similarity to the user's
     # weighted preference vector, so results aren't just "same cluster,
