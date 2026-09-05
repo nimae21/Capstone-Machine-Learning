@@ -2,7 +2,6 @@ from flask import Flask, jsonify, request
 import pandas as pd
 import numpy as np
 from sklearn.cluster import KMeans
-from sklearn.metrics.pairwise import cosine_similarity
 from db import fetch_all
 
 app = Flask(__name__)
@@ -13,19 +12,30 @@ ACTIVITY_WEIGHTS = {
     'add_to_cart': 5,
 }
 
-# Number of clusters K-Means will discover. This is a hyperparameter —
-# chosen based on catalog size. Rule of thumb: enough clusters that
-# products meaningfully separate, not so many that clusters become tiny.
-N_CLUSTERS = 5
+# Number of clusters K-Means will discover. Raised from 5 to 10 so
+# clusters can separate on brand identity as well as shoe type/category,
+# rather than being forced to merge different brands together just to
+# hit a small cluster count.
+N_CLUSTERS = 10
+
+FEATURE_COLUMNS = ['category_id', 'brand_id', 'shoe_type_id']
 
 
 def build_product_feature_matrix(products_df):
-    """One-hot encode each product into a numeric vector space."""
-    features = pd.get_dummies(
-        products_df[['category_id', 'brand_id', 'shoe_type_id']],
-        columns=['category_id', 'brand_id', 'shoe_type_id']
-    )
-    return features
+    """
+    One-hot encode each product into a numeric vector space, keeping
+    track of which columns belong to which original field so we can
+    later score candidates tier-by-tier (brand, then shoe_type, then
+    category) instead of treating every feature as equally important.
+    """
+    features = pd.get_dummies(products_df[FEATURE_COLUMNS], columns=FEATURE_COLUMNS)
+
+    column_groups = {
+        field: [c for c in features.columns if c.startswith(f"{field}_")]
+        for field in FEATURE_COLUMNS
+    }
+
+    return features, column_groups
 
 
 def cluster_products(feature_matrix, n_clusters):
@@ -47,10 +57,13 @@ def cluster_products(feature_matrix, n_clusters):
     return cluster_labels, model
 
 
-def get_user_dominant_cluster(activity_df, product_ids, cluster_labels):
+def get_user_dominant_clusters(activity_df, product_ids, cluster_labels, top_n=2):
     """
-    Determine which cluster the user gravitates toward, weighted by
-    how strongly they interacted with products in each cluster.
+    Determine which cluster(s) the user gravitates toward, weighted by
+    how strongly they interacted with products in each cluster. Returns
+    up to top_n clusters so a user with genuinely split interests (e.g.
+    both basketball and running shoes) isn't forced into a single
+    winner-take-all cluster.
     """
     activity_df = activity_df.copy()
     activity_df['weight'] = activity_df['activity_type'].map(ACTIVITY_WEIGHTS)
@@ -60,10 +73,66 @@ def get_user_dominant_cluster(activity_df, product_ids, cluster_labels):
     activity_df = activity_df.dropna(subset=['cluster'])
 
     if activity_df.empty:
-        return None
+        return []
 
-    cluster_scores = activity_df.groupby('cluster')['weight'].sum()
-    return int(cluster_scores.idxmax())
+    cluster_scores = activity_df.groupby('cluster')['weight'].sum().sort_values(ascending=False)
+    return [int(c) for c in cluster_scores.head(top_n).index]
+
+
+def build_user_preference_vector(feature_matrix, product_ids, activity_df):
+    """
+    Weighted average of the feature vectors of every product the user
+    interacted with, weighted by activity strength (view/search/cart).
+    """
+    activity_df_weighted = activity_df.copy()
+    activity_df_weighted['weight'] = activity_df_weighted['activity_type'].map(ACTIVITY_WEIGHTS)
+    product_weights = activity_df_weighted.groupby('product_id')['weight'].sum()
+    weights_aligned = np.array([product_weights.get(pid, 0) for pid in product_ids])
+
+    if weights_aligned.sum() == 0:
+        return np.zeros(feature_matrix.shape[1])
+
+    return (feature_matrix.T @ weights_aligned) / weights_aligned.sum()
+
+
+def rank_candidates_by_tier(candidates_df, feature_matrix, column_groups, user_vector):
+    """
+    Score each candidate against the user's preference vector separately
+    per feature group (brand, shoe_type, category), then sort so that a
+    brand match always outranks a shoe_type-only match, which always
+    outranks a category-only match — brand > shoe_type > category, in
+    that strict order. Within the same tier, ties are broken by overall
+    closeness (sum of the three scores).
+
+    This keeps genuine unsupervised clustering as the mechanism that
+    selects the *candidate pool* (see cluster_products), while giving
+    predictable, explainable ordering on how that pool gets ranked.
+    """
+    brand_cols = column_groups['brand_id']
+    shoe_type_cols = column_groups['shoe_type_id']
+    category_cols = column_groups['category_id']
+
+    brand_idx = [feature_matrix.columns.get_loc(c) for c in brand_cols]
+    shoe_type_idx = [feature_matrix.columns.get_loc(c) for c in shoe_type_cols]
+    category_idx = [feature_matrix.columns.get_loc(c) for c in category_cols]
+
+    candidate_vectors = feature_matrix.values[candidates_df.index]
+
+    brand_scores = candidate_vectors[:, brand_idx] @ user_vector[brand_idx]
+    shoe_type_scores = candidate_vectors[:, shoe_type_idx] @ user_vector[shoe_type_idx]
+    category_scores = candidate_vectors[:, category_idx] @ user_vector[category_idx]
+
+    ranked = candidates_df.copy()
+    ranked['brand_score'] = brand_scores
+    ranked['shoe_type_score'] = shoe_type_scores
+    ranked['category_score'] = category_scores
+
+    ranked = ranked.sort_values(
+        by=['brand_score', 'shoe_type_score', 'category_score'],
+        ascending=[False, False, False],
+    )
+
+    return ranked
 
 
 @app.route('/recommendations/<int:user_id>', methods=['GET'])
@@ -94,22 +163,22 @@ def get_recommendations(user_id):
     products_df = pd.DataFrame(all_products)
     product_ids = products_df['product_id'].tolist()
 
-    feature_matrix = build_product_feature_matrix(products_df)
+    feature_matrix, column_groups = build_product_feature_matrix(products_df)
 
     # --- UNSUPERVISED LEARNING: discover product clusters ---
     cluster_labels, kmeans_model = cluster_products(feature_matrix.values, N_CLUSTERS)
     products_df['cluster'] = cluster_labels
 
-    # Determine which cluster this user prefers, based on their activity
-    dominant_cluster = get_user_dominant_cluster(activity_df, product_ids, cluster_labels)
+    # Determine which cluster(s) this user prefers, based on their activity
+    dominant_clusters = get_user_dominant_clusters(activity_df, product_ids, cluster_labels, top_n=2)
 
-    if dominant_cluster is None:
+    if not dominant_clusters:
         return jsonify({'product_ids': [], 'reason': 'no_cluster_signal'})
 
-    # Prefer products from the user's cluster, but keep recommendations available
-    # when that cluster contains only products the user has already seen.
+    # Prefer products from the user's cluster(s), but keep recommendations
+    # available when those clusters contain only products already seen.
     cluster_candidates = products_df[
-        (products_df['cluster'] == dominant_cluster) &
+        (products_df['cluster'].isin(dominant_clusters)) &
         (~products_df['product_id'].isin(already_seen_ids))
     ]
 
@@ -120,31 +189,19 @@ def get_recommendations(user_id):
     if candidates.empty:
         return jsonify({'product_ids': [], 'reason': 'catalog_exhausted'})
 
-    # Rank within the cluster using cosine similarity to the user's
-    # weighted preference vector, so results aren't just "same cluster,
-    # arbitrary order" but genuinely ranked by closeness of fit.
-    activity_df_weighted = activity_df.copy()
-    activity_df_weighted['weight'] = activity_df_weighted['activity_type'].map(ACTIVITY_WEIGHTS)
-    product_weights = activity_df_weighted.groupby('product_id')['weight'].sum()
-    weights_aligned = np.array([product_weights.get(pid, 0) for pid in product_ids])
-
-    user_vector = (feature_matrix.values.T @ weights_aligned) / weights_aligned.sum()
-    user_vector = user_vector.reshape(1, -1)
-
-    candidate_indices = candidates.index
-    candidate_vectors = feature_matrix.values[candidate_indices]
-    similarities = cosine_similarity(user_vector, candidate_vectors)[0]
-
-    candidates = candidates.copy()
-    candidates['similarity'] = similarities
-    candidates = candidates.sort_values('similarity', ascending=False)
+    # Rank candidates: brand match first, then shoe_type match, then
+    # category match — so a same-brand product always outranks a
+    # same-shoe-type-different-brand product, which always outranks a
+    # same-category-only product. Other brands still appear, just lower.
+    user_vector = build_user_preference_vector(feature_matrix.values, product_ids, activity_df)
+    candidates = rank_candidates_by_tier(candidates, feature_matrix, column_groups, user_vector)
 
     top_products = candidates.head(limit)['product_id'].tolist()
 
     return jsonify({
         'product_ids': top_products,
         'reason': 'unsupervised_clustering',
-        'cluster_assigned': dominant_cluster,
+        'clusters_assigned': dominant_clusters,
         'total_clusters': int(kmeans_model.n_clusters),
     })
 
@@ -155,4 +212,4 @@ def health():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
