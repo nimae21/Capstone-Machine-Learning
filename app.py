@@ -1,3 +1,4 @@
+import hmac
 import os
 
 from flask import Flask, jsonify, request
@@ -7,6 +8,7 @@ from sklearn.cluster import KMeans
 from db import fetch_all
 
 app = Flask(__name__)
+RECOMMENDATION_SERVICE_KEY = os.environ.get('RECOMMENDATION_SERVICE_KEY', '')
 
 ACTIVITY_WEIGHTS = {
     'view': 1,
@@ -139,7 +141,21 @@ def rank_candidates_by_tier(candidates_df, feature_matrix, column_groups, user_v
 
 @app.route('/recommendations/<int:user_id>', methods=['GET'])
 def get_recommendations(user_id):
-    limit = int(request.args.get('limit', 8))
+    if user_id < 1:
+        return jsonify({'error': 'invalid_user'}), 422
+    if not RECOMMENDATION_SERVICE_KEY:
+        return jsonify({'error': 'service_not_configured'}), 503
+
+    supplied_key = request.headers.get('X-Recommendation-Key', '')
+    if not hmac.compare_digest(supplied_key, RECOMMENDATION_SERVICE_KEY):
+        return jsonify({'error': 'unauthorized'}), 401
+
+    try:
+        limit = int(request.args.get('limit', 8))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'invalid_limit'}), 422
+    if not 1 <= limit <= 20:
+        return jsonify({'error': 'invalid_limit'}), 422
 
     activities = fetch_all("""
         SELECT ua.product_id, ua.activity_type
