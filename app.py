@@ -70,7 +70,7 @@ def get_user_dominant_clusters(activity_df, product_ids, cluster_labels, top_n=2
     winner-take-all cluster.
     """
     activity_df = activity_df.copy()
-    activity_df['weight'] = activity_df['activity_type'].map(ACTIVITY_WEIGHTS)
+    activity_df['weight'] = weighted_activity_strength(activity_df)
 
     product_to_cluster = dict(zip(product_ids, cluster_labels))
     activity_df['cluster'] = activity_df['product_id'].map(product_to_cluster)
@@ -89,7 +89,7 @@ def build_user_preference_vector(feature_matrix, product_ids, activity_df):
     interacted with, weighted by activity strength (view/search/cart).
     """
     activity_df_weighted = activity_df.copy()
-    activity_df_weighted['weight'] = activity_df_weighted['activity_type'].map(ACTIVITY_WEIGHTS)
+    activity_df_weighted['weight'] = weighted_activity_strength(activity_df_weighted)
     product_weights = activity_df_weighted.groupby('product_id')['weight'].sum()
     weights_aligned = np.array([product_weights.get(pid, 0) for pid in product_ids])
 
@@ -97,6 +97,16 @@ def build_user_preference_vector(feature_matrix, product_ids, activity_df):
         return np.zeros(feature_matrix.shape[1])
 
     return (feature_matrix.T @ weights_aligned) / weights_aligned.sum()
+
+
+def weighted_activity_strength(activity_df):
+    """Apply the existing event weights and the number of events in each aggregate."""
+    if 'activity_count' in activity_df:
+        counts = pd.to_numeric(activity_df['activity_count'], errors='coerce').fillna(1).clip(lower=1)
+    else:
+        counts = 1
+
+    return activity_df['activity_type'].map(ACTIVITY_WEIGHTS) * counts
 
 
 def rank_candidates_by_tier(candidates_df, feature_matrix, column_groups, user_vector):
@@ -158,7 +168,7 @@ def get_recommendations(user_id):
         return jsonify({'error': 'invalid_limit'}), 422
 
     activities = fetch_all("""
-        SELECT ua.product_id, ua.activity_type
+        SELECT ua.product_id, ua.activity_type, COALESCE(ua.activity_count, 1) AS activity_count
         FROM user_activities ua
         WHERE ua.user_id = %s
     """, (user_id,))
